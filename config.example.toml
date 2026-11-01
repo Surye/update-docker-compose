@@ -1,0 +1,9 @@
+# All deployed Compose projects are discovered by default, regardless of location.
+check_interval_hours = 6
+
+# Exact Compose project names to exclude, such as temporary development stacks.
+exclude_projects = []
+
+# Optional absolute directory filters. Empty means all directories.
+# Paths starting with ~ are supported.
+include_directories = []
