@@ -66,6 +66,12 @@ locations. `UPDATE_DOCKER_COMPOSE_BIN_DIR` optionally changes the command direct
   Compose recreates changed services. Press Enter to close the terminal.
 - Shares a process lock between checks and updates. The tray reads the CLI's
   refreshed status automatically.
+- Binds confirmation to the reviewed projects and resolved Compose configuration,
+  including overrides and environment interpolation. If either changes before
+  updating, the CLI stops and asks you to run the review again. Configuration is
+  checked again after pulling, before recreating each project's services.
+- Reports failed or malformed container/image inspections as an incomplete check,
+  rather than reporting those containers as up to date.
 
 Checks follow the image references in your Compose files. They do not change
 version tags or digest pins. Locally built images without a pullable registry

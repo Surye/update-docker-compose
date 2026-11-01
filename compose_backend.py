@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import subprocess
@@ -36,6 +37,34 @@ class ComposeProject:
         for file in self.files:
             command.extend(["-f", str(file)])
         return [*command, *arguments]
+
+
+@dataclass(frozen=True)
+class UpdatePlan:
+    projects: tuple[ComposeProject, ...]
+    configuration_digests: tuple[str, ...]
+
+
+def _configuration_digest(project: ComposeProject) -> str:
+    # Hash the resolved model so overrides, interpolation and .env changes count.
+    # Never retain or print the model: it can contain environment secrets.
+    result = run(project.command("config", "--format", "json"), project.directory)
+    if result.returncode:
+        raise RuntimeError(f"{project.name}: could not resolve Compose configuration; run the review again")
+    try:
+        model = json.loads(result.stdout)
+        if not isinstance(model, dict):
+            raise ValueError("Expected a Compose model")
+    except ValueError as error:
+        raise RuntimeError(f"{project.name}: invalid Compose configuration; run the review again") from error
+    return hashlib.sha256(json.dumps(model, sort_keys=True).encode()).hexdigest()
+
+
+def prepare_update_plan(root: Path | None = DOCKER_ROOT) -> UpdatePlan:
+    """Capture the deployment scope and resolved configuration before consent."""
+    with operation_lock():
+        projects = tuple(compose_projects(root))
+        return UpdatePlan(projects, tuple(_configuration_digest(project) for project in projects))
 
 
 def compose_projects(root: Path | None = DOCKER_ROOT) -> list[ComposeProject]:
@@ -87,12 +116,13 @@ def run(command: list[str], cwd: Path | None = None, *, live: bool = False) -> s
     )
 
 
-def _image_updates(root: Path | None = DOCKER_ROOT, report: Callable[[str], None] | None = None) -> CheckResult:
+def _image_updates(root: Path | None = DOCKER_ROOT, report: Callable[[str], None] | None = None,
+                   *, projects: tuple[ComposeProject, ...] | None = None) -> CheckResult:
     """Pull project images, then compare them with images used by running containers."""
     updates: list[str] = []
     errors: list[str] = []
 
-    for project in compose_projects(root):
+    for project in compose_projects(root) if projects is None else projects:
         project_dir = project.directory
         if report:
             report(f"Checking {project.name}…")
@@ -111,28 +141,43 @@ def _image_updates(root: Path | None = DOCKER_ROOT, report: Callable[[str], None
         for container_id in containers.stdout.split():
             inspected = run(["docker", "inspect", container_id])
             if inspected.returncode:
+                errors.append(f"{project.name}: container inspection failed ({container_id})")
                 continue
             try:
-                container = json.loads(inspected.stdout)[0]
-                if container.get("State", {}).get("Status") != "running":
+                payload = json.loads(inspected.stdout)
+                if not isinstance(payload, list) or len(payload) != 1:
+                    raise ValueError("Expected one container")
+                container = payload[0]
+                status = container["State"]["Status"]
+                if status not in ("created", "running", "paused", "restarting", "removing", "exited", "dead"):
+                    raise ValueError("Invalid container state")
+                if status != "running":
                     continue
-                service = container.get("Config", {}).get("Labels", {}).get(
+                config = container["Config"]
+                service = (config.get("Labels") or {}).get(
                     "com.docker.compose.service", "container"
                 )
-                current_id = container.get("Image")
-                image_ref = container.get("Config", {}).get("Image")
-                latest = run(["docker", "image", "inspect", image_ref, "--format", "{{.Id}}"])
-                if latest.returncode == 0 and latest.stdout.strip() != current_id:
-                    updates.append(f"{project.name} / {service}")
-            except (ValueError, IndexError, TypeError):
+                current_id = container["Image"]
+                image_ref = config["Image"]
+                if any(not isinstance(value, str) or not value.strip()
+                       for value in (current_id, image_ref, service)):
+                    raise ValueError("Missing image or service metadata")
+            except (ValueError, KeyError, TypeError, AttributeError):
+                errors.append(f"{project.name}: invalid container inspection ({container_id})")
                 continue
+            latest = run(["docker", "image", "inspect", image_ref, "--format", "{{.Id}}"])
+            if latest.returncode or not latest.stdout.strip():
+                errors.append(f"{project.name} / {service}: image inspection failed")
+                continue
+            if latest.stdout.strip() != current_id:
+                updates.append(f"{project.name} / {service}")
 
     return CheckResult(tuple(updates), tuple(errors))
 
 
-def _update_projects(root: Path | None = DOCKER_ROOT, *, live: bool = False) -> tuple[str, ...]:
+def _update_projects(plan: UpdatePlan, *, live: bool = False) -> tuple[str, ...]:
     errors: list[str] = []
-    for project in compose_projects(root):
+    for project, digest in zip(plan.projects, plan.configuration_digests, strict=True):
         project_dir = project.directory
         if live:
             print(f"\nUpdating {project.name}…", flush=True)
@@ -142,6 +187,10 @@ def _update_projects(root: Path | None = DOCKER_ROOT, *, live: bool = False) -> 
         )
         if pull.returncode:
             errors.append(f"{project_dir.name}: image pull failed")
+            continue
+        # Pulls can take a long time; check again immediately before recreation.
+        if _configuration_digest(project) != digest:
+            errors.append(f"{project.name}: Compose configuration changed; run the review again")
             continue
         result = run(
             project.command("up", "-d", "--remove-orphans"),
@@ -186,13 +235,19 @@ def save_status(result: CheckResult) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def image_updates(root: Path | None = DOCKER_ROOT, report: Callable[[str], None] | None = None) -> CheckResult:
+def image_updates(root: Path | None = DOCKER_ROOT, report: Callable[[str], None] | None = None,
+                  *, projects: tuple[ComposeProject, ...] | None = None) -> CheckResult:
     with operation_lock():
-        result = _image_updates(root, report)
+        result = _image_updates(root, report, projects=projects)
         save_status(result)
         return result
 
 
-def update_projects(root: Path | None = DOCKER_ROOT, *, live: bool = False) -> tuple[str, ...]:
+def update_projects(plan: UpdatePlan, root: Path | None = DOCKER_ROOT, *, live: bool = False) -> tuple[str, ...]:
     with operation_lock():
-        return _update_projects(root, live=live)
+        if tuple(compose_projects(root)) != plan.projects:
+            raise RuntimeError("Deployed Compose projects changed; run the review again before updating")
+        digests = tuple(_configuration_digest(project) for project in plan.projects)
+        if digests != plan.configuration_digests:
+            raise RuntimeError("Compose configuration changed; run the review again before updating")
+        return _update_projects(plan, live=live)

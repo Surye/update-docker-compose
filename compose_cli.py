@@ -6,18 +6,19 @@ import fcntl
 import argparse
 import sys
 
-from compose_backend import cache_directory, compose_projects, image_updates, update_projects
+from compose_backend import cache_directory, image_updates, prepare_update_plan, update_projects
 
 
 def main(*, check_only: bool = False) -> int:
     print("Docker Compose Updates\n", flush=True)
-    projects = compose_projects()
+    plan = prepare_update_plan()
+    projects = plan.projects
     if not projects:
         print("No deployed Compose projects match your configuration.")
         return 0
     print("Deployed projects: " + ", ".join(project.name for project in projects), flush=True)
     print("Checking for container updates… (waiting if another check is running)", flush=True)
-    result = image_updates(report=lambda message: print(message, flush=True))
+    result = image_updates(report=lambda message: print(message, flush=True), projects=projects)
     for error in result.errors:
         print(f"Warning: {error}")
     if not result.updates:
@@ -36,7 +37,7 @@ def main(*, check_only: bool = False) -> int:
     if answer not in ("y", "yes"):
         print("Update cancelled.")
         return 0
-    errors = update_projects(live=True)
+    errors = update_projects(plan, live=True)
     for error in errors:
         print(f"Error: {error}")
     print("\nRefreshing container status…", flush=True)

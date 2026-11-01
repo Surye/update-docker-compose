@@ -16,7 +16,9 @@ from update_docker_compose import ComposeUpdater, QSystemTrayIcon
 
 class InteractiveWorkflowTests(unittest.TestCase):
     def run_cli(self, answer, results, update_errors=()):
-        with patch.object(compose_cli, "compose_projects", return_value=[backend.ComposeProject("example", (Path("/example/compose.yaml"),), Path("/example"))]), \
+        project = backend.ComposeProject("example", (Path("/example/compose.yaml"),), Path("/example"))
+        self.plan = backend.UpdatePlan((project,), ("reviewed-digest",))
+        with patch.object(compose_cli, "prepare_update_plan", return_value=self.plan), \
              patch.object(compose_cli, "image_updates", side_effect=results), \
              patch.object(compose_cli, "update_projects", return_value=update_errors) as update, \
              patch("builtins.input", return_value=answer) as prompt, \
@@ -32,7 +34,7 @@ class InteractiveWorkflowTests(unittest.TestCase):
     def test_confirmation_streams_updates_and_refreshes_status(self):
         code, update, _ = self.run_cli("y", [backend.CheckResult(("app / server",), ()), backend.CheckResult((), ())])
         self.assertEqual(code, 0)
-        update.assert_called_once_with(live=True)
+        update.assert_called_once_with(self.plan, live=True)
 
     def test_failed_update_returns_failure(self):
         code, _, _ = self.run_cli("y", [backend.CheckResult(("app / server",), ()), backend.CheckResult((), ())], ("app: update failed",))
@@ -69,9 +71,11 @@ class TrayLaunchTests(unittest.TestCase):
 
 class BackendTests(unittest.TestCase):
     def test_failed_pull_prevents_project_recreation(self):
-        with patch.object(backend, "compose_projects", return_value=[backend.ComposeProject("example", (Path("/example/compose.yaml"),), Path("/example"))]), \
-             patch.object(backend, "run", return_value=Mock(returncode=1)) as run:
-            errors = backend._update_projects(live=True)
+        project = backend.ComposeProject("example", (Path("/example/compose.yaml"),), Path("/example"))
+        plan = backend.UpdatePlan((project,), ("reviewed-digest",))
+        with patch.object(backend, "run", return_value=Mock(returncode=1)) as run, \
+             contextlib.redirect_stdout(io.StringIO()):
+            errors = backend._update_projects(plan, live=True)
         self.assertEqual(len(errors), 1)
         self.assertEqual(run.call_count, 1)
         self.assertEqual(run.call_args.args[0][-1], "pull")
@@ -83,6 +87,169 @@ class BackendTests(unittest.TestCase):
             result = backend.image_updates()
             state = json.loads(backend.status_file().read_text())
         self.assertEqual(state["updates"], list(result.updates))
+
+
+class InspectionFailureTests(unittest.TestCase):
+    def setUp(self):
+        self.project = backend.ComposeProject("example", (Path("/example/compose.yaml"),), Path("/example"))
+        self.container = {
+            "State": {"Status": "running"},
+            "Config": {"Labels": {"com.docker.compose.service": "web"}, "Image": "example:latest"},
+            "Image": "sha256:old",
+        }
+
+    def check(self, inspected, latest=None):
+        calls = [Mock(returncode=0), Mock(returncode=0, stdout="container-id"), inspected]
+        if latest is not None:
+            calls.append(latest)
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(os.environ, {"XDG_CACHE_HOME": directory}), \
+             patch.object(backend, "compose_projects", return_value=[self.project]), \
+             patch.object(backend, "run", side_effect=calls):
+            result = backend.image_updates()
+            state = json.loads(backend.status_file().read_text())
+        self.assertEqual(state["errors"], list(result.errors))
+        return result
+
+    def test_failed_container_inspection_marks_check_incomplete(self):
+        result = self.check(Mock(returncode=1))
+        self.assertTrue(result.errors)
+        self.assertIn("example", result.errors[0])
+        self.assertEqual(result.updates, ())
+
+    def test_malformed_container_inspection_marks_check_incomplete(self):
+        for response in ("not-json", "[]", "{}", "null", "[null]", "[{}]",
+                         '[{"State":{"Status":"invalid-state"}}]',
+                         '[{"State":{"Status":"running"},"Config":null}]',
+                         '[{"State":{"Status":"running"},"Config":{"Image":null},"Image":"old"}]'):
+            with self.subTest(response=response):
+                result = self.check(Mock(returncode=0, stdout=response))
+                self.assertTrue(result.errors)
+                self.assertEqual(result.updates, ())
+
+    def test_failed_or_empty_image_inspection_marks_check_incomplete(self):
+        for latest in (Mock(returncode=1), Mock(returncode=0, stdout=" \n")):
+            with self.subTest(latest=latest):
+                result = self.check(Mock(returncode=0, stdout=json.dumps([self.container])), latest)
+                self.assertTrue(result.errors)
+                self.assertEqual(result.updates, ())
+
+    def test_successful_image_comparison_reports_updates(self):
+        for image_id, updates in (("sha256:old", ()), ("sha256:new", ("example / web",))):
+            with self.subTest(image_id=image_id):
+                result = self.check(Mock(returncode=0, stdout=json.dumps([self.container])),
+                                    Mock(returncode=0, stdout=image_id + "\n"))
+                self.assertEqual(result.updates, updates)
+                self.assertEqual(result.errors, ())
+
+    def test_stopped_container_is_skipped_without_an_error(self):
+        self.container["State"]["Status"] = "exited"
+        result = self.check(Mock(returncode=0, stdout=json.dumps([self.container])))
+        self.assertEqual(result, backend.CheckResult((), ()))
+
+
+class ConsentScopeTests(unittest.TestCase):
+    """Run the real CLI/backend against a Docker command boundary double."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.names = ["reviewed"]
+        self.configurations = {"reviewed": {"services": {"web": {"image": "example:latest"}}}}
+        self.updated = []
+        self.pulled = []
+        self.after_pull = lambda: None
+        self.config_failure = False
+        for name in ("reviewed", "unreviewed"):
+            (self.root / f"{name}.yaml").touch()
+        self.enterContext(patch.dict(os.environ, {"XDG_CACHE_HOME": str(self.root)}))
+        self.enterContext(patch.object(backend, "load_settings", return_value=Settings()))
+        self.enterContext(patch.object(backend, "run", side_effect=self.docker))
+
+    def docker(self, command, cwd=None, *, live=False):
+        if command[1] == "ps":
+            return Mock(returncode=0, stdout=" ".join(self.names))
+        if command[1] == "inspect":
+            if "--format" in command:
+                records = [DeployedDiscoveryTests().metadata(name, self.root, [self.root / f"{name}.yaml"])
+                           for name in self.names]
+                return Mock(returncode=0, stdout="\n".join(records))
+            name = command[-1]
+            container = {"State": {"Status": "running"},
+                         "Config": {"Labels": {"com.docker.compose.service": "web"}, "Image": "example:latest"},
+                         "Image": "sha256:new" if name in self.updated else "sha256:old"}
+            return Mock(returncode=0, stdout=json.dumps([container]))
+        if command[1:3] == ["image", "inspect"]:
+            return Mock(returncode=0, stdout="sha256:new")
+        if command[1] == "compose":
+            name = command[3]
+            if "config" in command:
+                if self.config_failure:
+                    return Mock(returncode=1, stdout="", stderr="sensitive environment values")
+                return Mock(returncode=0, stdout=json.dumps(self.configurations[name]))
+            if "pull" in command:
+                self.pulled.append(name)
+                self.after_pull()
+                return Mock(returncode=0)
+            if "ps" in command:
+                return Mock(returncode=0, stdout=name)
+            if "up" in command:
+                self.updated.append(name)
+                return Mock(returncode=0)
+        self.fail(f"Unexpected Docker command: {command}")
+
+    def cli(self, change=lambda: None):
+        def confirm(_prompt):
+            change()
+            return "y"
+
+        self.output = io.StringIO()
+        self.errors = io.StringIO()
+        with patch("builtins.input", side_effect=confirm), \
+             contextlib.redirect_stdout(self.output), contextlib.redirect_stderr(self.errors):
+            return compose_cli.entrypoint()
+
+    def test_new_project_after_review_requires_fresh_confirmation(self):
+        def change():
+            self.names.append("unreviewed")
+            self.configurations["unreviewed"] = self.configurations["reviewed"]
+
+        self.assertEqual(self.cli(change), 1)
+        self.assertEqual(self.updated, [])
+
+    def test_removed_project_after_review_requires_fresh_confirmation(self):
+        self.assertEqual(self.cli(self.names.clear), 1)
+        self.assertEqual(self.updated, [])
+
+    def test_changed_effective_configuration_requires_fresh_confirmation(self):
+        def change():
+            self.configurations["reviewed"]["services"]["web"]["privileged"] = True
+
+        self.assertEqual(self.cli(change), 1)
+        self.assertEqual(self.updated, [])
+        self.assertEqual(self.pulled, ["reviewed"])
+
+    def test_configuration_failure_after_review_prevents_update(self):
+        def change():
+            self.config_failure = True
+
+        self.assertEqual(self.cli(change), 1)
+        self.assertEqual(self.updated, [])
+        self.assertNotIn("sensitive environment values", self.errors.getvalue())
+
+    def test_configuration_change_during_update_pull_prevents_recreation(self):
+        def change():
+            if len(self.pulled) == 2:
+                self.configurations["reviewed"]["services"]["web"]["privileged"] = True
+
+        self.after_pull = change
+        self.assertEqual(self.cli(), 1)
+        self.assertEqual(self.updated, [])
+
+    def test_unchanged_review_updates_successfully(self):
+        self.assertEqual(self.cli(), 0)
+        self.assertEqual(self.updated, ["reviewed"])
 
 
 class DeployedDiscoveryTests(unittest.TestCase):
@@ -102,18 +269,20 @@ class DeployedDiscoveryTests(unittest.TestCase):
                 file.parent.mkdir(parents=True, exist_ok=True)
                 file.touch()
             labels = self.metadata("media-stack", deployed.parent, [deployed])
-            with patch.object(backend, "run", side_effect=[
+            with patch.dict(os.environ, {"XDG_CACHE_HOME": directory}), patch.object(backend, "run", side_effect=[
                 Mock(returncode=0, stdout="container-id"),
                 Mock(returncode=0, stdout=labels),
-                Mock(returncode=0), Mock(returncode=0),
+                Mock(returncode=0, stdout="{}"),
+                Mock(returncode=0), Mock(returncode=0, stdout="{}"), Mock(returncode=0),
             ]) as run:
-                self.assertEqual(backend._update_projects(root), ())
+                plan = backend.prepare_update_plan(root)
+                self.assertEqual(backend._update_projects(plan), ())
             commands = [call.args[0] for call in run.call_args_list]
-            self.assertEqual(len(commands), 4)
+            self.assertEqual(len(commands), 6)
             self.assertFalse(any(str(backup) in command for command in commands))
             self.assertIn(str(deployed), commands[2])
-            self.assertIn("--project-name", commands[3])
-            self.assertIn("media-stack", commands[3])
+            self.assertIn("--project-name", commands[-1])
+            self.assertIn("media-stack", commands[-1])
 
     def test_project_name_working_directory_and_overrides_are_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
