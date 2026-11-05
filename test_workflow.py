@@ -4,7 +4,10 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from unittest.mock import Mock, patch
 
@@ -53,6 +56,61 @@ class InteractiveWorkflowTests(unittest.TestCase):
 
 
 class TrayLaunchTests(unittest.TestCase):
+    def test_completed_checks_finish_worker_cleanup_before_refreshing_menu(self):
+        # Isolate Qt and bound the test so a GUI deadlock fails instead of
+        # hanging the suite. Docker and the desktop tray host stay mocked out.
+        script = textwrap.dedent('''
+            import json
+            import tempfile
+            from unittest.mock import patch
+            from PySide6.QtCore import QTimer
+            from PySide6.QtWidgets import QApplication
+            from compose_backend import CheckResult
+            from update_docker_compose import ComposeUpdater
+
+            app = QApplication([])
+            finished_before_refresh = []
+
+            class ObservedUpdater(ComposeUpdater):
+                def show_status(self):
+                    if self.thread is not None:
+                        finished_before_refresh.append(self.thread.isFinished())
+                    super().show_status()
+
+            with tempfile.TemporaryDirectory() as directory, \
+                 patch.dict("os.environ", {"XDG_CACHE_HOME": directory,
+                                           "XDG_CONFIG_HOME": directory}), \
+                 patch("update_docker_compose.image_updates",
+                       return_value=CheckResult(("example / web",), ())), \
+                 patch("update_docker_compose.QSystemTrayIcon.show"), \
+                 patch("update_docker_compose.QTimer.singleShot"):
+                updater = ObservedUpdater(app)
+
+                def check_completion():
+                    if updater.thread is None and finished_before_refresh:
+                        if len(finished_before_refresh) == 3:
+                            app.quit()
+                        else:
+                            updater.start_job("check")
+
+                timer = QTimer()
+                timer.timeout.connect(check_completion)
+                timer.start(10)
+                updater.start_job("check")
+                app.exec()
+                print(json.dumps({"finished_before_refresh": finished_before_refresh,
+                                  "containers": [a.text() for a in updater.pending_menu.actions()]}))
+        ''')
+        result = subprocess.run(
+            [sys.executable, "-c", script], cwd=Path(__file__).parent,
+            env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(result.stdout)
+        self.assertEqual(state["finished_before_refresh"], [True, True, True])
+        self.assertEqual(state["containers"], ["example / web"])
+
     def test_left_click_opens_cli_and_context_click_does_not(self):
         updater = Mock()
         ComposeUpdater.activate_tray(updater, QSystemTrayIcon.ActivationReason.Context)

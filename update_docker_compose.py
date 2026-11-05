@@ -192,6 +192,13 @@ class ComposeUpdater(QObject):
         self.thread = None
 
     def job_finished(self, result: object) -> None:
+        if self.thread is not None:
+            # Finish deferred worker deletion before KDE disconnects menu
+            # actions. Otherwise Qt's connection lock and Python's GIL can
+            # deadlock across the GUI and worker threads. wait() releases
+            # the GIL; Docker work has already finished when this slot runs.
+            self.thread.quit()
+            self.thread.wait()
         self.check_action.setEnabled(True)
         if isinstance(result, CheckResult):
             self.last_result = result
